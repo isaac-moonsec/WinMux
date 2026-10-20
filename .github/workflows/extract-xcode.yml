@@ -1,0 +1,152 @@
+name: Extract Xcode
+
+# Run manually on a fork to copy an Xcode whose macOS SDK and Swift compiler match the
+# local Command Line Tools (`xcrun --show-sdk-version`, `swift --version`). The archive is
+# encrypted with the XCODE_ARCHIVE_PASSPHRASE secret, because artifacts on public repos can
+# be downloaded by any signed-in GitHub user. Install it with
+# script/install-xcode-from-artifact.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner image label to search (e.g. macos-26, macos-latest)
+        default: macos-26
+      sdk-version:
+        description: macOS SDK version to match (xcrun --show-sdk-version)
+        default: "27.0"
+      swiftlang:
+        description: Swift compiler build to match (the swiftlang-… part of swift --version)
+        default: swiftlang-6.4.0.34.1
+      survey-only:
+        description: Only list the installed Xcodes; don't archive anything
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    name: Find and archive a matching Xcode
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    env:
+      SDK_VERSION: ${{ inputs.sdk-version }}
+      SWIFTLANG: ${{ inputs.swiftlang }}
+      # Macro implementations the local SDK's SwiftUICore.swiftinterface expects from SwiftUIMacros.
+      SWIFTUI_MACRO_TYPES: >-
+        AnimatableIgnoredMacro AnimatablePairDataMacro AnimatablePairDataPropertyMacro
+        AnimatablePropertyMacro AnimatableValuesDataMacro AnimatableValuesDataPropertyMacro
+        AnimatableValuesMacro EntryDefaultValueMacro EntryMacro EntryTypeCheckClassMacro
+        EntryTypeCheckMacro InvalidAnimatablePropertyMacro ProjectedValueMacro
+        SendableEntryDefaultMacro StateInitialStoredValueMacro StateMacro
+        StateProjectedValueMacro StatePropertyWrapperStorageMacro StateTypeMacro
+        UnsafeEntryDefaultMacro
+    steps:
+      - name: List installed Xcodes
+        run: |
+          set -euo pipefail
+          {
+            echo "### Xcodes on \`${{ inputs.runner }}\`"
+            echo
+            echo "Looking for macOS SDK \`$SDK_VERSION\` with \`$SWIFTLANG\`."
+            echo
+            echo "| Xcode | Version | macOS SDK | SDK build | Swift | Match |"
+            echo "|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          : > "$RUNNER_TEMP/matches"
+          for app in /Applications/Xcode*.app; do
+            # /Applications/Xcode.app is usually a symlink to one of the versioned apps.
+            [ -L "$app" ] && continue
+            export DEVELOPER_DIR="$app/Contents/Developer"
+            version=$(xcodebuild -version 2>/dev/null | paste -sd ' ' - || echo "?")
+            sdk=$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || echo "?")
+            sdk_build=$(xcrun --sdk macosx --show-sdk-build-version 2>/dev/null || echo "?")
+            swift=$(xcrun swift --version 2>/dev/null | grep -o 'swiftlang-[0-9.]*' || echo "?")
+            match=""
+            if [ "$sdk" = "$SDK_VERSION" ] && [ "$swift" = "$SWIFTLANG" ]; then
+              match="✅"
+              echo "$app" >> "$RUNNER_TEMP/matches"
+            fi
+            echo "| $(basename "$app") | $version | $sdk | $sdk_build | $swift | $match |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          {
+            echo
+            echo '```'
+            df -h /
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick the matching Xcode
+        id: pick
+        run: |
+          set -euo pipefail
+          if [ ! -s "$RUNNER_TEMP/matches" ]; then
+            echo "::error::No Xcode on ${{ inputs.runner }} has macOS SDK $SDK_VERSION with $SWIFTLANG. See the table in the job summary."
+            exit 1
+          fi
+          app=$(head -1 "$RUNNER_TEMP/matches")
+          echo "Picked $app"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$app" .app)" >> "$GITHUB_OUTPUT"
+
+      - name: Check the SwiftUI macro plugin
+        env:
+          APP: ${{ steps.pick.outputs.app }}
+        run: |
+          set -euo pipefail
+          plugin=$(find "$APP/Contents/Developer" -name libSwiftUIMacros.dylib -print -quit)
+          if [ -z "$plugin" ]; then
+            echo "::error::libSwiftUIMacros.dylib not found in $APP"
+            exit 1
+          fi
+          echo "Plugin: $plugin"
+          symbols=$(strings -a "$plugin")
+          missing=""
+          for type in $SWIFTUI_MACRO_TYPES; do
+            grep -q "$type" <<< "$symbols" || missing="$missing $type"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::The plugin lacks macro types the local SDK needs:$missing"
+            exit 1
+          fi
+          echo "All $(wc -w <<< "$SWIFTUI_MACRO_TYPES" | tr -d ' ') macro types present."
+
+      - name: Archive and encrypt
+        if: ${{ !inputs.survey-only }}
+        env:
+          APP: ${{ steps.pick.outputs.app }}
+          NAME: ${{ steps.pick.outputs.name }}
+          XCODE_ARCHIVE_PASSPHRASE: ${{ secrets.XCODE_ARCHIVE_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$XCODE_ARCHIVE_PASSPHRASE" ]; then
+            echo "::error::Set the XCODE_ARCHIVE_PASSPHRASE repository secret first."
+            exit 1
+          fi
+          command -v zstd >/dev/null || brew install zstd
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          cd "$out"
+          # Streamed end to end, so the runner never holds an unencrypted copy on disk.
+          # Parts stay under 2 GB to keep each artifact upload manageable.
+          tar -cf - -C "$(dirname "$APP")" "$(basename "$APP")" \
+            | zstd -T0 -6 \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:XCODE_ARCHIVE_PASSPHRASE \
+            | split -b 1900m - "$NAME.tar.zst.enc.part-"
+          shasum -a 256 "$NAME".tar.zst.enc.part-* > SHA256SUMS
+          printf '%s\n' "$NAME" "$SDK_VERSION" "$SWIFTLANG" > xcode-info.txt
+          ls -lh
+
+      - name: Upload
+        if: ${{ !inputs.survey-only }}
+        # todo pin to a commit SHA like the actions in ci.yml
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pick.outputs.name }}
+          path: ${{ runner.temp }}/out/
+          compression-level: 0 # already compressed and encrypted
+          retention-days: 1
+          if-no-files-found: error
