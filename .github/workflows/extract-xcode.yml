@@ -18,6 +18,9 @@ on:
       swiftlang:
         description: Swift compiler build to match (the swiftlang-… part of swift --version)
         default: swiftlang-6.4.0.34.1
+      xcode:
+        description: "Which matching Xcode to take, e.g. Xcode_27.app (default: the first match)"
+        default: ""
       survey-only:
         description: Only list the installed Xcodes; don't archive anything
         type: boolean
@@ -81,13 +84,23 @@ jobs:
 
       - name: Pick the matching Xcode
         id: pick
+        env:
+          WANTED: ${{ inputs.xcode }}
         run: |
           set -euo pipefail
           if [ ! -s "$RUNNER_TEMP/matches" ]; then
             echo "::error::No Xcode on ${{ inputs.runner }} has macOS SDK $SDK_VERSION with $SWIFTLANG. See the table in the job summary."
             exit 1
           fi
-          app=$(head -1 "$RUNNER_TEMP/matches")
+          if [ -n "$WANTED" ]; then
+            app=$(grep -Fx "/Applications/$WANTED" "$RUNNER_TEMP/matches" || true)
+            if [ -z "$app" ]; then
+              echo "::error::$WANTED isn't among the matching Xcodes: $(xargs -n1 basename < "$RUNNER_TEMP/matches" | paste -sd ' ' -)"
+              exit 1
+            fi
+          else
+            app=$(head -1 "$RUNNER_TEMP/matches")
+          fi
           echo "Picked $app"
           echo "app=$app" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$app" .app)" >> "$GITHUB_OUTPUT"
